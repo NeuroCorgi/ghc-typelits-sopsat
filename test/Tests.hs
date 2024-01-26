@@ -553,7 +553,7 @@ main :: IO ()
 main = defaultMain tests
 
 tests :: TestTree
-tests = testGroup "ghc-typelits-natnormalise"
+tests = testGroup "ghc-typelits-sopsat"
   [ testGroup "Basic functionality"
     [ testCase "show (head (1:>2:>3:>Nil))" $
       show (head (1:>2:>3:>Nil)) @?=
