@@ -1,4 +1,5 @@
 {-# LANGUAGE CPP                   #-}
+{-# LANGUAGE DataKinds             #-}
 {-# LANGUAGE FlexibleInstances     #-}
 {-# LANGUAGE LambdaCase            #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
@@ -10,75 +11,67 @@ where
 
 import Control.Arrow (second)
 import Control.Monad (forM)
-import Control.Monad.Trans.Writer.Strict
+import Control.Monad.IO.Class (liftIO)
+import Control.Monad.Trans.Writer.Strict (Writer, runWriter, tell)
 
-import Data.IORef
-
+import Data.IORef (IORef, newIORef, readIORef, modifyIORef, modifyIORef')
 import Data.Set (Set, union, fromList)
-import qualified Data.Set as S
-import Data.List (intersect, partition, find, nubBy)
+import qualified Data.Set as S (empty, notMember)
+import Data.List (intersect, partition, find)
 import Data.Maybe (mapMaybe, fromMaybe, isJust, catMaybes)
 import Data.Functor ((<&>))
 import Data.Function (on)
 
 import GHC.Builtin.Names (eqTyConKey, heqTyConKey, hasKey, knownNatClassName)
 import GHC.Builtin.Types
-  (promotedTrueDataCon, promotedFalseDataCon, cTupleTyCon, naturalTy, cTupleDataCon)
-import GHC.Builtin.Types.Literals
-  (typeNatAddTyCon, typeNatSubTyCon, typeNatExpTyCon, typeNatCmpTyCon, typeNatMulTyCon)
-
-import GHC.Core (Expr(Coercion))
-import GHC.Core.Class (className)
-import GHC.Core.DataCon (dataConWrapId)
-import GHC.Core.Predicate
-  (Pred(EqPred, IrredPred), EqRel (NomEq), classifyPredType, isEqPred, isEqPrimPred, mkPrimEqPred, getClassPredTys_maybe)
-import GHC.Core.TyCon (TyCon)
-#if MIN_VERSION_ghc(9,6,0)
-import GHC.Core.Type (TyVar, typeKind, coreView, mkTyConApp, mkNumLitTy, mkTyVarTy, tyConAppTyCon_maybe)
-import GHC.Core.TyCo.Compare (eqType, nonDetCmpType, nonDetCmpTc)
-#else
-import GHC.Core.Type
-  (TyVar, typeKind, coreView, mkTyConApp, mkNumLitTy, mkTyVarTy, tyConAppTyCon_maybe, eqType, nonDetCmpType, nonDetCmpTc)
-#endif
-import GHC.Core.TyCo.Rep (Type(TyConApp, TyVarTy, LitTy), Kind, TyLit (NumTyLit), UnivCoProvenance (PluginProv), PredType)
-
-import GHC.Driver.Plugins
-  (Plugin(..), defaultPlugin, purePlugin)
-import GHC.Plugins (mkModuleName, mkTcOcc, fsLit, mkUnivCo, Outputable)
-import GHC.Tc.Plugin (tcLookupTyCon, tcPluginIO, newEvVar)
-
-import GHC.Tc.Types
-  (TcPlugin(..), TcPluginM, TcPluginSolveResult (..))
-import GHC.Tc.Types.Constraint
-  ( Ct, ctEvPred, ctEvidence, isGiven, CtEvidence (..), ctEvExpr, ctLoc, mkNonCanonical
-  , CtLoc, ctLocSpan, ctEvLoc, setCtEvLoc, setCtLocSpan, TcEvDest (..), emptyRewriterSet
+  ( promotedTrueDataCon, promotedFalseDataCon, cTupleTyCon, naturalTy
+  , cTupleDataCon
   )
-import GHC.Tc.Types.Evidence (EvBindsVar, EvTerm (EvExpr), Role (Nominal, Representational), evId, evCast)
+import GHC.Builtin.Types.Literals
+  ( typeNatAddTyCon, typeNatSubTyCon, typeNatExpTyCon, typeNatCmpTyCon
+  , typeNatMulTyCon
+  )
+import GHC.Core.DataCon (dataConWrapId)
+import GHC.Core.Predicate (isEqPrimPred, mkPrimEqPred, getClassPredTys_maybe)
+#if MIN_VERSION_ghc(9,6,0)
+import GHC.Core.Type (coreView)
+import GHC.Core.TyCo.Compare (nonDetCmpTc)
+#else
+import GHC.Core.Type (typeKind, coreView, mkNumLitTy, nonDetCmpTc)
+#endif
+import GHC.Core.TyCo.Rep (Type(TyConApp, TyVarTy, LitTy), TyLit (NumTyLit))
+import GHC.Driver.Plugins (Plugin(..), defaultPlugin, purePlugin)
+import GHC.Plugins (IsOutput(..))
+import GHC.Tc.Types.Constraint
+  (CtEvidence (..), ctLocSpan, setCtEvLoc, setCtLocSpan, emptyRewriterSet)
+import GHC.TcPlugin.API
+  ( TcPlugin(..), TcPluginStage(..), TcPluginSolveResult(..), TcEvDest(..)
+  , TcPluginM, Pred(..), EqRel(..), Role(..), EvTerm(..), Expr(Coercion)
+  , Kind, PredType, TyCon, TyVar, CtLoc, Ct, EvTerm, Outputable
+  , mkTcPlugin, mkPluginUnivCo, mkModuleName, mkTcOcc, mkNumLitTy
+  , mkTyConApp, mkTyVarTy, mkNonCanonical, tcLookupTyCon, tcPluginTrace
+  , ctLoc, ctEvPred, ctEvidence, ctEvExpr, ctEvLoc, evId, evCast, newEvVar
+  , newGiven, newWanted, isEqPred, isGiven, classifyPredType, typeKind
+  ,  className, eqType, nonDetCmpType, tyConAppTyCon_maybe, fsLit
+  , emptyUFM, ppr
+  )
+import GHC.TcPlugin.API.Internal (liftTcPluginM)
+import GHC.TcPluginM.Extra (lookupModule, lookupName)
+import GHC.Utils.Outputable (showPprUnsafe, (<+>), ($$), text)
 
-import GHC.Types.Unique.FM (emptyUFM)
-
-import GHC.TcPluginM.Extra
-  (tracePlugin, lookupModule, lookupName, newGiven, newWanted)
-
-import SoPSat.Satisfier
-  (SolverState, evalStatements, runStatements, withState, declare, assert, unify, ranges)
-import SoPSat.SoP
-  (SoPE(..), OrdRel(..), (|+|), (|-|), (|*|), (|^|))
-import qualified SoPSat.SoP as SoP
-import SoPSat.Internal.SoP
-  (SoP (..), Product (..), Symbol (..), Atom (..))
-import GHC.Utils.Outputable (showPprUnsafe, Outputable (..), (<+>), text)
-
+import SoPSat.Satisfier (SolverState, evalStatements,  declare, assert, unify)
+import SoPSat.SoP (SoPE(..), OrdRel(..), (|+|), (|-|), (|*|), (|^|))
+import qualified SoPSat.SoP as SoP (cons, func, int)
+import SoPSat.Internal.SoP (SoP (..), Product (..), Symbol (..), Atom (..))
 
 isEqPredClass :: PredType -> Bool
 isEqPredClass ty = case tyConAppTyCon_maybe ty of
   Just tc -> tc `hasKey` eqTyConKey || tc `hasKey` heqTyConKey
   _       -> False
 
-
 plugin :: Plugin
 plugin = defaultPlugin
-  { tcPlugin = const (Just satisfierPlugin)
+  { tcPlugin = const $ Just $ mkTcPlugin satisfierPlugin
   , pluginRecompile = purePlugin
   }
 
@@ -100,18 +93,18 @@ instance Eq CType where
 instance Ord CType where
   compare = nonDetCmpType `on` unCType
 
-lookupDefs :: TcPluginM Defs
+lookupDefs :: TcPluginM 'Init Defs
 lookupDefs =
   do
-    ref <- tcPluginIO $ newIORef S.empty
-    md <- lookupModule ordModule basePackage
+    ref <- liftIO $ newIORef S.empty
+    md <- liftTcPluginM $ lookupModule ordModule basePackage
     ordCond <- look md "OrdCond"
     leqT <- look md "<="
-    md1 <- lookupModule typeErrModule basePackage
+    md1 <- liftTcPluginM $ lookupModule typeErrModule basePackage
     assertT <- look md1 "Assert"
     return (ref, (leqT,assertT,ordCond))
   where
-    look md s = tcLookupTyCon =<< lookupName md (mkTcOcc s)
+    look md s = tcLookupTyCon =<< liftTcPluginM (lookupName md $ mkTcOcc s)
     ordModule = mkModuleName "Data.Type.Ord"
     typeErrModule = mkModuleName "GHC.TypeError"
     basePackage = fsLit "base"
@@ -124,16 +117,16 @@ assertOrUnify expr =
                         False -> unify expr <&> \case [] -> Right False
                                                       xs -> Left xs
 
-satisfierSolve :: Defs -> EvBindsVar -> [Ct] -> [Ct] -> TcPluginM TcPluginSolveResult
-satisfierSolve defs@(gen'd,(leqT,_,_)) ev givens [] = do
-  done <- tcPluginIO $ readIORef gen'd
+satisfierSolve :: Defs -> [Ct] -> [Ct] -> TcPluginM 'Solve TcPluginSolveResult
+satisfierSolve defs@(gen'd,(leqT,_,_)) givens [] = do
+  done <- liftIO $ readIORef gen'd
   let
     unit_givens = map fst $ mapMaybe (toNatEquality defs) givens
     reds = reduceGivens leqT done givens
     newlyDone = map (\(_,(prd,_,_)) -> CType prd) reds
-  tcPluginIO $ modifyIORef' gen'd $ union (fromList newlyDone)
+  liftIO $ modifyIORef' gen'd $ union (fromList newlyDone)
   newGivens <- forM reds $ \(origCt,(pred',evTerm,_)) ->
-                             mkNonCanonical' (ctLoc origCt) <$> newGiven ev (ctLoc origCt) pred' evTerm
+                             mkNonCanonical' (ctLoc origCt) <$> newGiven (ctLoc origCt) pred' evTerm
 
   let checked = fromMaybe [] $
         evalStatements (forM unit_givens (\(ct, expr) -> (ct,) <$> declare expr))
@@ -142,17 +135,17 @@ satisfierSolve defs@(gen'd,(leqT,_,_)) ev givens [] = do
     (_,[]) -> return (TcPluginOk [] newGivens)
     (_,contradicts) -> return (TcPluginContradiction (map fst contradicts))
 
-satisfierSolve defs@(gen'd,(leqT,_,_)) ev givens wanteds = do
-  done <- tcPluginIO $ readIORef gen'd
+satisfierSolve defs@(gen'd,(leqT,_,_)) givens wanteds = do
+  done <- liftIO $ readIORef gen'd
   let unit_givens = map (second (subsToPred leqT)) $ mapMaybe (toNatEquality defs) givens
       redGs = reduceGivens leqT done givens
       newlyDone = map (\(_,(prd,_,_)) -> CType prd) redGs
       unit_wanteds = map (second (subsToPred leqT)) $ mapMaybe (toNatEquality defs) wanteds
       nonEqs = filter (not . (\p -> isEqPred p || isEqPrimPred p) . ctEvPred . ctEvidence) wanteds
   redGivens <- forM redGs $ \(origCt, (pred',evTerm,_)) ->
-                              mkNonCanonical' (ctLoc origCt) <$> newGiven ev (ctLoc origCt) pred' evTerm
+                              mkNonCanonical' (ctLoc origCt) <$> newGiven (ctLoc origCt) pred' evTerm
   reducible_wanteds <- catMaybes <$> mapM (\ct -> fmap (ct,) <$> reduceNatConstr (givens ++ redGivens) ct) nonEqs
-  tcPluginIO $ modifyIORef gen'd $ union (fromList newlyDone)
+  liftIO $ modifyIORef gen'd $ union (fromList newlyDone)
   if null unit_wanteds && null reducible_wanteds
     then return (TcPluginOk [] [])
     else let state = mapM (declare . snd . fst) unit_givens
@@ -181,11 +174,11 @@ satisfierSolve defs@(gen'd,(leqT,_,_)) ev givens wanteds = do
 
     declareUnifiers u@(Left unifiers) = mapM_ declare unifiers >> return u
     declareUnifiers r@(Right _) = return r
-    
+
     succeeded (Right res) = res
     succeeded (Left _)    = True
 
-    evidence :: ((Ct,Either [SoPE TyCon SoPVar] Bool),[PredType]) -> TcPluginM (Maybe ((EvTerm,Ct),[Ct]))
+    evidence :: ((Ct,Either [SoPE TyCon SoPVar] Bool),[PredType]) -> TcPluginM 'Solve (Maybe ((EvTerm,Ct),[Ct]))
     evidence ((ct,Right _),nw)       = attachEvidence ct nw
     evidence ((ct,Left unifiers),nw) = attachEvidence ct (nw ++ map unifyItemToPredType unifiers)
 
@@ -226,7 +219,7 @@ tryReduceGiven leqT simplGivens ct = do
   pred' <- mans
   return (pred', toReducedDict (ctEvidence ct) pred', ws')
 
-reduceNatConstr :: [Ct] -> Ct -> TcPluginM (Maybe (EvTerm, [(Type,Type)], [Ct]))
+reduceNatConstr :: [Ct] -> Ct -> TcPluginM 'Solve (Maybe (EvTerm, [(Type,Type)], [Ct]))
 reduceNatConstr givens ct =
   let pred0 = ctEvPred $ ctEvidence ct
       (mans,tests) = runWriter $ normaliseNatEverywhere pred0
@@ -238,9 +231,9 @@ reduceNatConstr givens ct =
           Just (cls,_) | className cls /= knownNatClassName -> do
                            evVar <- newEvVar pred'
                            let wDict = mkNonCanonical (CtWanted pred' (EvVarDest evVar) (ctLoc ct) emptyRewriterSet)
-                               evCo = mkUnivCo (PluginProv "ghc-typelits-sopsat") Representational pred' pred0
+                               evCo = mkPluginUnivCo "ghc-typelits-sopsat" Representational [] pred' pred0
                                ev = evId evVar `evCast` evCo
-                           return (Just (ev, tests, [wDict]))
+                           return (Just (EvExpr ev, tests, [wDict]))
           _ -> return Nothing
         Just c -> return (Just (toReducedDict (ctEvidence c) pred0, tests, []))
 
@@ -248,9 +241,9 @@ toReducedDict :: CtEvidence -> PredType -> EvTerm
 toReducedDict ct pred' =
   let
     pred0 = ctEvPred ct
-    evCo = mkUnivCo (PluginProv "ghc-typelits-sopsat") Representational pred0 pred'
+    evCo = mkPluginUnivCo "ghc-typelits-sopsat" Representational [] pred0 pred'
     ev = ctEvExpr ct `evCast` evCo
-  in ev
+  in EvExpr ev
 
 data SoPVar
   = Const Type
@@ -457,7 +450,7 @@ instance FromSoP TyCon SoPVar Type where
             | otherwise
             = Right (s1,[p1]) : y : ys
           mergeExp x ys = Left x : ys
-      
+
       fromSymbol (Left (I i)) = mkNumLitTy i
       fromSymbol (Left (A a)) = fromAtom a
       fromSymbol (Left (E s p)) = mkTyConApp typeNatExpTyCon [fromSoP s, fromProduct p]
@@ -488,7 +481,7 @@ unifyItemToPredType SoPE{..} = mkPrimEqPred ty1 ty2
 rangeToPred :: TyCon -> SoPE TyCon SoPVar -> PredType
 rangeToPred leqT (SoPE a b _) = subToPred leqT (fromSoP b, fromSoP a)
 
-evSubstPreds :: CtLoc -> [PredType] -> TcPluginM [Ct]
+evSubstPreds :: CtLoc -> [PredType] -> TcPluginM 'Solve [Ct]
 evSubstPreds loc = mapM (fmap mkNonCanonical . newWanted loc)
 
 mkNonCanonical' :: CtLoc -> CtEvidence -> Ct
@@ -498,17 +491,51 @@ mkNonCanonical' origCtl ev =
     ctl   = ctEvLoc ev
   in mkNonCanonical (setCtEvLoc ev (setCtLocSpan ctl ct_ls))
 
-attachEvidence :: Ct -> [PredType] -> TcPluginM (Maybe ((EvTerm,Ct),[Ct]))
-attachEvidence ct preds = do 
+attachEvidence :: Ct -> [PredType] -> TcPluginM 'Solve (Maybe ((EvTerm,Ct),[Ct]))
+attachEvidence ct preds = do
   holeWanteds <- evSubstPreds (ctLoc ct) preds
   case classifyPredType $ ctEvPred $ ctEvidence ct of
     EqPred NomEq t1 t2 ->
-      let ctEv = mkUnivCo (PluginProv "ghc-typelits-sopsat") Nominal t1 t2
+      let ctEv = mkPluginUnivCo "ghc-typelits-sopsat" Nominal [] t1 t2
       in return (Just ((EvExpr (Coercion ctEv), ct), holeWanteds))
     IrredPred p ->
       let t1 = mkTyConApp (cTupleTyCon 0) []
-          co = mkUnivCo (PluginProv "ghc-typelits-sopsat") Representational t1 p
+          co = mkPluginUnivCo "ghc-typelits-sopsat" Representational [] t1 p
           dcApp = evId $ dataConWrapId $ cTupleDataCon 0
-      in return (Just ((evCast dcApp co, ct), holeWanteds))
+      in return (Just ((EvExpr $ evCast dcApp co, ct), holeWanteds))
     _ -> return Nothing
-    
+
+-- | Print out extra information about the initialisation, stop, and every run
+-- of the plugin when @-ddump-tc-trace@ is enabled.
+tracePlugin :: String -> TcPlugin -> TcPlugin
+tracePlugin s TcPlugin{..} = TcPlugin
+  { tcPluginInit    = traceInit
+  , tcPluginSolve   = traceSolve
+  , tcPluginRewrite = tcPluginRewrite
+  , tcPluginStop    = traceStop
+  }
+ where
+  traceInit = do
+    tcPluginTrace ("tcPluginInit " ++ s) empty >> tcPluginInit
+
+  traceStop  z = tcPluginTrace ("tcPluginStop " ++ s) empty >> tcPluginStop z
+
+  traceSolve z given wanted = do
+    tcPluginTrace ("tcPluginSolve start " ++ s)
+                      (text "given   =" <+> ppr given
+                    $$ text "wanted  =" <+> ppr wanted)
+    r <- tcPluginSolve z given wanted
+    case r of
+      TcPluginOk solved new
+        -> tcPluginTrace ("tcPluginSolve ok " ++ s)
+                         (text "solved =" <+> ppr solved
+                       $$ text "new    =" <+> ppr new)
+      TcPluginContradiction bad
+        -> tcPluginTrace ("tcPluginSolve contradiction " ++ s)
+                         (text "bad =" <+> ppr bad)
+      TcPluginSolveResult bad solved new
+        -> tcPluginTrace ("tcPluginSolveResult " ++ s)
+                         (text "solved =" <+> ppr solved
+                       $$ text "bad    =" <+> ppr bad
+                       $$ text "new    =" <+> ppr new)
+    return r

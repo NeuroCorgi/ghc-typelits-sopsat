@@ -25,6 +25,7 @@ library
                       containers          >=0.5 && <0.7,
                       transformers         >=0.5,
                       ghc                  >=9.4 && <9.8,
+                      ghc-tcplugin-api     >=0.15.0,
                       ghc-tcplugins-extra ^>=0.4.1,
                       sop-satisfier        >=0.3.4.4
     hs-source-dirs:   src
@@ -47,4 +48,3 @@ test-suite ghc-typelits-sopsat-test
         tasty ^>=1.5,
         tasty-hunit ^>=0.9,
         ghc-typelits-sopsat
-
